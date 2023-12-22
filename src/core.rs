@@ -2,6 +2,7 @@ use sha1::Digest;
 use std::{
     fs,
     io::{Read, Write},
+    os::unix::fs::PermissionsExt,
 };
 
 pub struct App {}
@@ -19,10 +20,12 @@ impl App {
             self.cat_file(blob_sha)
         } else if args[1] == "hash-object" {
             let file_path = args[3].clone();
-            self.hash_object(&file_path)
+            self.hash_object(&file_path);
         } else if args[1] == "ls-tree" {
             let tree_sha = args[3].clone();
             self.ls_tree(tree_sha)
+        } else if args[1] == "write-tree" {
+            self.write_tree()
         }
     }
 
@@ -47,7 +50,24 @@ impl App {
         print!("{}", content);
     }
 
-    fn hash_object(&self, file_path: &str) {
+    fn hash_object(&self, file_path: &str) -> Vec<u8> {
+        let (compressed, bin_hash) = self.make_blob_object(file_path);
+        let hash = hex::encode(&bin_hash[..]);
+        let subfolder = &hash[0..2];
+        fs::create_dir_all(format!(".git/objects/{}/", subfolder)).unwrap();
+        match fs::write(
+            format!(".git/objects/{}/{}", subfolder, &hash[2..]),
+            compressed,
+        ) {
+            Ok(_) => {}
+            Err(e) => println!("{e}"),
+        }
+
+        println!("{}", hash);
+        bin_hash
+    }
+
+    fn make_blob_object(&self, file_path: &str) -> (Vec<u8>, Vec<u8>) {
         let content = fs::read(file_path).unwrap();
         let header_bytes = format!("blob {}\0", content.len()).into_bytes();
         let content = [&header_bytes[..], &content[..]].concat();
@@ -59,18 +79,7 @@ impl App {
         let mut hasher = sha1::Sha1::new();
         hasher.update(&content);
         let hash = hasher.finalize();
-
-        println!("{}", hex::encode(hash));
-        let hash = hex::encode(hash);
-        let subfolder = &hash[0..2];
-        fs::create_dir_all(format!(".git/objects/{}/", subfolder)).unwrap();
-        match fs::write(
-            format!(".git/objects/{}/{}", subfolder, &hash[2..]),
-            compressed,
-        ) {
-            Ok(_) => {}
-            Err(e) => println!("{e}"),
-        }
+        (compressed, hash.as_slice().to_vec())
     }
 
     fn ls_tree(&self, tree_sha: String) {
@@ -126,5 +135,90 @@ impl App {
             .unwrap();
 
         content
+    }
+
+    fn write_tree(&self) {
+        let tree_hash = self.make_tree_object(".");
+        println!("{}", hex::encode(&tree_hash));
+    }
+
+    fn make_tree_object(&self, path: &str) -> Vec<u8> {
+        let mut tree_entries = Vec::new();
+        let git_ignore = if let Ok(file) = fs::read(".gitignore") {
+            String::from_utf8(fs::read(".gitignore").unwrap()).unwrap()
+        } else {
+            "".into()
+        };
+
+        if let Ok(entries) = fs::read_dir(path) {
+            entries.filter(|entry| {
+                let file_name = entry.as_ref().unwrap().file_name();
+                if git_ignore.contains(file_name.to_str().unwrap()) {
+                    return false;
+                }
+
+                if file_name.to_str().unwrap() == ".git" {
+                    return false;
+                }
+
+                return true;
+            }).for_each(|entry| {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    let mode = format!("{:o}", 0o40000);
+                    let tree_hash = self.make_tree_object(entry.path().to_str().unwrap());
+                    tree_entries.push((
+                        mode,
+                        entry.file_name().to_string_lossy().to_string(),
+                        tree_hash,
+                    ));
+                } else if entry.file_type().unwrap().is_file() {
+                    let perms = entry.metadata().unwrap().permissions();
+                    let mode = format!("{:o}", perms.mode());
+                    let (_, hash) = self.make_blob_object(entry.path().to_str().unwrap());
+                    tree_entries.push((
+                        mode,
+                        entry.file_name().to_string_lossy().to_string(),
+                        hash,
+                    ));
+                }
+            })
+        }
+
+        tree_entries.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut content: Vec<u8> = vec![];
+
+        /**
+         * [mode] [file/folder name]\0[SHA-1 of referencing blob or tree]
+         * **/
+        for (mode, name, sha) in tree_entries {
+            content.extend(format!("{} {}\0", mode, name).as_bytes());
+            content.extend(sha);
+        }
+        let header = format!("tree {}\0", content.len()).into_bytes();
+        let content = [&header[..], &content[..]].concat();
+
+        let mut compressed = Vec::new();
+        let mut compressor =
+            flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::fast());
+        compressor.write_all(&content).unwrap();
+        compressor.finish().unwrap();
+
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(&content);
+        let bin_hash = hasher.finalize();
+
+        let hash = hex::encode(&bin_hash[..]);
+        let subfolder = &hash[0..2];
+        fs::create_dir_all(format!(".git/objects/{}/", subfolder)).unwrap();
+        match fs::write(
+            format!(".git/objects/{}/{}", subfolder, &hash[2..]),
+            compressed,
+        ) {
+            Ok(_) => {}
+            Err(e) => println!("{e}"),
+        }
+
+        bin_hash.as_slice().to_vec()
     }
 }
