@@ -30,3 +30,4 @@ anyhow = "1.0.59"                                                  # error handl
 thiserror = "1.0.32"                                               # error handling
 sha2 = "0.10.8"
 hex-literal = "0.4.1"
+chrono = "0.4.31"
