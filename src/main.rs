@@ -3,12 +3,12 @@ use std::env;
 #[allow(unused_imports)]
 use std::fs;
 
-mod core;
+use git_starter_rust::App;
 
 fn main() {
     // Uncomment this block to pass the first stage
     let args: Vec<String> = env::args().collect();
 
-    core::App::new().run(args); 
+    App::new().run(args); 
 
 }

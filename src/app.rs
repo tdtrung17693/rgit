@@ -1,10 +1,13 @@
-use chrono::{TimeZone, Utc, NaiveDate};
+use chrono::{NaiveDate, TimeZone, Utc};
 use sha1::Digest;
 use std::{
     fs,
     io::{Read, Write},
     os::unix::fs::PermissionsExt,
 };
+
+use crate::git_client::{get_refs, get_objects, Repo};
+
 
 pub struct App {}
 
@@ -29,9 +32,25 @@ impl App {
             self.write_tree()
         } else if args[1] == "commit-tree" {
             let tree_sha = args[2].clone();
-            let message = if args.len() == 5 { args[4].clone() } else { args[6].clone() };
-            let parent_hash = if args.len() == 7 { Some(&args[4]) } else { None };
+            let message = if args.len() == 5 {
+                args[4].clone()
+            } else {
+                args[6].clone()
+            };
+            let parent_hash = if args.len() == 7 {
+                Some(&args[4])
+            } else {
+                None
+            };
             self.commit_tree(&tree_sha, &message, parent_hash.map(|x| &x[..]));
+        } else if args[1] == "clone" {
+            let url = args[2].strip_suffix('/').clone().unwrap_or(&args[2]);
+            let dir = if args.len() == 4 {
+                &args[3]
+            } else {
+                ""
+            };
+            self.clone(&url, dir);
         }
     }
 
@@ -58,25 +77,19 @@ impl App {
 
     fn hash_object(&self, file_path: &str) -> Vec<u8> {
         let (compressed, bin_hash) = self.make_blob_object(file_path);
-        let hash = hex::encode(&bin_hash[..]);
-        let subfolder = &hash[0..2];
-        fs::create_dir_all(format!(".git/objects/{}/", subfolder)).unwrap();
-        match fs::write(
-            format!(".git/objects/{}/{}", subfolder, &hash[2..]),
-            compressed,
-        ) {
-            Ok(_) => {}
-            Err(e) => println!("{e}"),
-        }
+        self.persist_git_object(&bin_hash[..], &compressed[..]);
 
-        println!("{}", hash);
         bin_hash
     }
 
     fn make_blob_object(&self, file_path: &str) -> (Vec<u8>, Vec<u8>) {
         let content = fs::read(file_path).unwrap();
-        let header_bytes = format!("blob {}\0", content.len()).into_bytes();
-        let content = [&header_bytes[..], &content[..]].concat();
+        self.make_git_object(&content, "blob")
+    }
+
+    fn make_git_object(&self, content: &[u8], obj_type: &str) -> (Vec<u8>, Vec<u8>) {
+        let header_bytes = format!("{obj_type} {}\0", content.len()).into_bytes();
+        let content = [&header_bytes[..], content].concat();
         let mut compressed = Vec::new();
         let mut compressor =
             flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::fast());
@@ -86,6 +99,20 @@ impl App {
         hasher.update(&content);
         let hash = hasher.finalize();
         (compressed, hash.as_slice().to_vec())
+    }
+
+    fn persist_git_object(&self, bin_hash: &[u8], compressed_content: &[u8]) {
+        let hash = hex::encode(bin_hash);
+        let subfolder = &hash[0..2];
+        fs::create_dir_all(format!(".git/objects/{}/", subfolder)).unwrap();
+        match fs::write(
+            format!(".git/objects/{}/{}", subfolder, &hash[2..]),
+            compressed_content,
+        ) {
+            Ok(_) => {}
+            Err(e) => println!("{e}"),
+        }
+        println!("{}", hash);
     }
 
     fn ls_tree(&self, tree_sha: String) {
@@ -114,7 +141,40 @@ impl App {
                     acc.push((mode, name, "".into()));
                 } else {
                     if part.len() < 20 {
-                        panic!("Invalid tree entry: {}", String::from_utf8_lossy(&part));
+                        return acc
+                    }
+                    let sha = &part[0..20];
+                    acc[i - 1].2 = hex::encode(sha);
+
+                    if let Some((mode, name)) =
+                        std::str::from_utf8(&part[20..]).unwrap().split_once(' ')
+                    {
+                        acc.push((mode, name, "".into()))
+                    };
+                }
+
+                acc
+            });
+        entries.sort_by(|a, b| a.1.cmp(b.1));
+        for (_mode, name, _sha) in entries {
+            println!("{}", name)
+        }
+    }
+
+    fn parse_tree_object(&self, content: &[u8]) {
+        let parts = content.split(|x| *x == b'\n');
+
+        let mut entries = parts
+            .skip(1)
+            .enumerate()
+            .filter(|(_, x)| !x.is_empty())
+            .fold(Vec::new(), |mut acc, (i, part)| {
+                if i == 0 {
+                    let (mode, name) = std::str::from_utf8(part).unwrap().split_once(' ').unwrap();
+                    acc.push((mode, name, "".into()));
+                } else {
+                    if part.len() < 20 {
+                        panic!("Invalid tree entry: {}", String::from_utf8_lossy(part));
                     }
                     let sha = &part[0..20];
                     acc[i - 1].2 = hex::encode(sha);
@@ -197,28 +257,19 @@ impl App {
         }
 
         tree_entries.sort_by(|a, b| a.1.cmp(&b.1));
-        let mut content: Vec<u8> = vec![];
+        let content: Vec<u8> =
+            tree_entries
+                .iter()
+                .fold(vec![], |mut content, (mode, name, sha)| {
+                    content.extend(format!("{} {}\0", mode, name).as_bytes());
+                    content.extend(sha);
+                    content
+                });
 
         /*
         [mode] [file/folder name]\0[SHA-1 of referencing blob or tree]
         */
-        for (mode, name, sha) in tree_entries {
-            content.extend(format!("{} {}\0", mode, name).as_bytes());
-            content.extend(sha);
-        }
-        let header = format!("tree {}\0", content.len()).into_bytes();
-        let content = [&header[..], &content[..]].concat();
-
-        let mut compressed = Vec::new();
-        let mut compressor =
-            flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::fast());
-        compressor.write_all(&content).unwrap();
-        compressor.finish().unwrap();
-
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(&content);
-        let bin_hash = hasher.finalize();
-
+        let (compressed, bin_hash) = self.make_git_object(&content, "tree");
         let hash = hex::encode(&bin_hash[..]);
         let subfolder = &hash[0..2];
         fs::create_dir_all(format!(".git/objects/{}/", subfolder)).unwrap();
@@ -239,7 +290,12 @@ impl App {
         println!("{}", hash);
     }
 
-    fn make_commit_object(&self, tree_hash: &str, message: &str, parent_hash: Option<&str>) -> Vec<u8> {
+    fn make_commit_object(
+        &self,
+        tree_hash: &str,
+        message: &str,
+        parent_hash: Option<&str>,
+    ) -> Vec<u8> {
         let committer_name = "Trung Tran";
         let committer_email = "trungtran@email.com";
         let mut content: Vec<u8> = Vec::new();
@@ -248,27 +304,28 @@ impl App {
         // let timezone = now.timezone().offset_from_local_date();
         let offset = now.offset();
         let hour = offset.local_minus_utc() / 3600;
-        let timezone = format!("{}{:02}00", if hour < 0 {"-"} else {"+"}, hour.abs());
+        let timezone = format!("{}{:02}00", if hour < 0 { "-" } else { "+" }, hour.abs());
 
         content.extend(format!("tree {}\n", tree_hash).as_bytes());
         if let Some(parent_hash) = parent_hash {
             content.extend(format!("parent {}\n", parent_hash).as_bytes());
         }
-        content.extend(format!("author {} <{}> {} {}\n", committer_name, committer_email, timestamp, timezone).as_bytes());
-        content.extend(format!("committer {} <{}> {} {}\n\n", committer_name, committer_email, timestamp, timezone).as_bytes());
+        content.extend(
+            format!(
+                "author {} <{}> {} {}\n",
+                committer_name, committer_email, timestamp, timezone
+            )
+            .as_bytes(),
+        );
+        content.extend(
+            format!(
+                "committer {} <{}> {} {}\n\n",
+                committer_name, committer_email, timestamp, timezone
+            )
+            .as_bytes(),
+        );
         content.extend(format!("{}\n", message).as_bytes());
-        let header= format!("commit {}\0", content.len()).into_bytes();
-        let content = [&header[..], &content[..]].concat();
-        let mut compressed = Vec::new();
-        let mut compressor =
-            flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::fast());
-        compressor.write_all(&content).unwrap();
-        compressor.finish().unwrap();
-
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(&content);
-        let bin_hash = hasher.finalize();
-
+        let (compressed, bin_hash) = self.make_git_object(&content, "commit");
         let hash = hex::encode(&bin_hash[..]);
         let subfolder = &hash[0..2];
         fs::create_dir_all(format!(".git/objects/{}/", subfolder)).unwrap();
@@ -281,6 +338,18 @@ impl App {
         }
 
         bin_hash.as_slice().to_vec()
+    }
+
+    fn clone(&self, url: &str, path: &str) {
+        // let refs 
+        // let refs = get_refs(url).unwrap();
+        // let packs = get_objects(url, refs.refs.iter().map(|x| x.hash.clone()).collect());
+        let current_dir = std::env::current_dir().unwrap();
+        let path = format!("{}/{}", current_dir.to_str().unwrap(), path);
+        println!("path = {path}");
+        println!("url = {url}");
+        let mut repo = Repo::new(url, &path);
+        repo.clone();
     }
 
     fn timestamp() -> u128 {
